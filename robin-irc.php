@@ -104,14 +104,23 @@ class Robin_IRC {
                     $line = trim(fgets($this->listen_sockets[self::IRC_SOCK], 8192));
                     if ($line && strlen($line)) {
                         $this->debug('IRC<-', $line);
-                        $pos = strpos($line, ' ');
-                        if ( $pos === false ) {
+                        if ( strpos($line, ' ') === false ) {
                             $cmd = $line;
                             $msg = array();
                         }
                         else {
-                            $cmd = substr($line, 0, $pos);
-                            $msg = array(substr($line, $pos + 1));
+                            list($cmd, $msg) = split(' ', $line, 2);
+                            // Split arguments on space, except : denotes
+                            // the last argument, which may contain spaces
+                            $colonpos = strpos($msg, ':');
+                            if ( $colonpos === false ) {
+                                $msg = split(' ', $msg);
+                            }
+                            else {
+                                $lastarg = substr($msg, $colonpos+1);
+                                $msg = split(' ', trim(substr($msg, 0, $colonpos)));
+                                array_push($msg, $lastarg);
+                            }
                         }
                         call_user_func_array(array($this, 'irc_'.$cmd), $msg);
                     }
@@ -147,58 +156,51 @@ class Robin_IRC {
     }
 
     public function login() {
-        $this->out_irc(null, 'NOTICE', 'AUTH', 'Fetching token...');
-
-        // Step 1: Fetch the login form
+        $this->out_irc(null, 'NOTICE', 'AUTH', 'Logging in to Reddit...');
         $c = curl_init();
+        $form = http_build_query(array(
+            'user' => $this->redditnick,
+            'passwd' => $this->redditpass
+        ));
         $options = array(
-            CURLOPT_URL => self::REDDIT_REFERER_URL,
+            //CURLOPT_VERBOSE => true,
+            CURLOPT_URL => self::REDDIT_LOGIN_URL,
             CURLOPT_HEADER => true,
             CURLOPT_TIMEOUT => 30,
             CURLOPT_USERAGENT => 'Robin-IRC Bridge/0.0.1',
             CURLOPT_RETURNTRANSFER => true,
-            CURLOPT_SSL_VERIFYPEER => false
-        );
-        curl_setopt_array($c, $options);
-        $r = curl_exec($c);
-        curl_close($c);
-
-        list($headers, $body) = split("\r\n\r\n", $r);
-        $html = new \Masterminds\HTML5();
-        $dom = $html->loadHTML($body);
-        $qp = qp($dom);
-
-        // Step 2: Copy the cookies from the first page load
-        $form = http_build_query(array(
-            'op' => 'login',
-            'dest' => 'https://www.reddit.com/robin/',
-            'user' => $this->redditnick,
-            'passwd' => $this->redditpass
-        ));
-        $cookies = $this->parse_cookies($headers);
-        $options += array(
+            CURLOPT_SSL_VERIFYPEER => false,
             CURLOPT_POST => true,
             CURLOPT_POSTFIELDS => $form,
-            CURLOPT_REFERER => 'https://www.reddit.com/',
             CURLOPT_HTTPHEADER => array(
                 'Content-type: application/x-www-form-urlencoded',
-                'Content-length: '.strlen($form),
-                'Cookie: ' . join('; ', $cookies)
+                'Content-length: '.strlen($form)
             )
         );
-        $options[CURLOPT_URL] = self::REDDIT_LOGIN_URL;
 
         $c = curl_init();
         curl_setopt_array($c, $options);
         $r = curl_exec($c);
         curl_close($c);
 
-        $this->out_irc(null, 'NOTICE', 'AUTH', 'Logged in to Reddit.');
-
         list($headers, $body) = split("\r\n\r\n", $r);
-        $this->robin_cookies = array_merge($cookies, $this->parse_cookies($headers));
-        $this->out_irc(null, 'NOTICE', 'AUTH', 'Authenticated.');
-        $this->refresh();
+
+        $this->robin_cookies = $this->parse_cookies($headers);
+        $ok = 0;
+        foreach ( $this->robin_cookies as $cookie ) {
+            if ( strpos($cookie, "reddit_session=") === 0 ) {
+                $ok = 1;
+                break;
+            }
+        }
+        if ( $ok ) {
+            $this->out_irc(null, 'NOTICE', 'AUTH', 'Authenticated.');
+            $this->refresh();
+        }
+        else {
+            $this->out_irc(null, 'NOTICE', 'AUTH', 'FAILED to authenticate.');
+            throw new Exception;
+        }
     }
 
     protected function refresh() {
@@ -333,6 +335,7 @@ class Robin_IRC {
         switch (strtoupper($protocol)) {
             case 'IRC':
                 switch (strtoupper($msg)) {
+                    // FIXME: Error checking on number of arguments
                     case 'PASS':
                         $this->redditpass = $args[0];
                         break;
@@ -376,8 +379,8 @@ class Robin_IRC {
                         break;
 
                     case 'PRIVMSG':
-                        $channel = trim(substr($args[0], 0, strpos($args[0], ':')));
-                        $str = substr($args[0], strpos($args[0], ':') + 1);
+                        $channel = $args[0];
+                        $str = $args[1];
 
                         if (strpos($str, "\001ACTION") === 0) {
                             $str = strtr($str, array(
@@ -421,6 +424,13 @@ class Robin_IRC {
                             else {
                                 $this->out_irc(null, '401', array($this->redditnick, $user), "No such user");
                             }
+                        }
+                        break;
+
+                    case 'WHOWAS':
+                        $users = split(',', $args[0]);
+                        foreach ($users as $user) {
+                            $this->out_irc(null, '406', array($this->redditnick, $user), "Was no such user");
                         }
                         break;
 
@@ -500,6 +510,10 @@ class Robin_IRC {
                         // We need the new websocket URL
                         $this->redditws->close();
                         $this->refresh();
+                        break;
+                    case 'USERS_ABANDONED':
+                        // users_abandoned {"users":["Atheron3"]} (? -> 1724)
+                        $this->out_irc(null, 'NOTICE', '#dev', $msg . ' ' . json_encode($payload));
                         break;
                 }
                 break;
